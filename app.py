@@ -1,5 +1,12 @@
 import io
 import html
+import base64
+import hashlib
+import hmac
+import secrets
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 from openai import OpenAI
@@ -31,42 +38,292 @@ MODEL = "gpt-5.6-luna"
 
 
 # =========================================================
-# ACCÈS PROTÉGÉ
+# ACCÈS PROTÉGÉ — PROFESSEUR + CODES ÉLÈVES TEMPORAIRES
 # =========================================================
+
+PARIS = ZoneInfo("Europe/Paris")
+
+
+def _base36_encode(nombre):
+    caracteres = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if nombre == 0:
+        return "0"
+
+    resultat = ""
+    while nombre:
+        nombre, reste = divmod(nombre, 36)
+        resultat = caracteres[reste] + resultat
+    return resultat
+
+
+def _base36_decode(texte):
+    return int(texte, 36)
+
+
+def _normaliser_code_temporaire(code):
+    return "".join(
+        caractere for caractere in str(code).upper()
+        if caractere.isalnum()
+    )
+
+
+def _formater_code_temporaire(code):
+    brut = _normaliser_code_temporaire(code)
+    return "-".join(
+        brut[i:i + 4]
+        for i in range(0, len(brut), 4)
+    )
+
+
+def _secret_token():
+    try:
+        valeur = str(st.secrets["TOKEN_SECRET"]).strip()
+    except Exception:
+        valeur = ""
+
+    if not valeur:
+        raise RuntimeError(
+            "TOKEN_SECRET n'est pas configuré dans les Secrets Streamlit."
+        )
+
+    return valeur.encode("utf-8")
+
+
+def generer_code_temporaire(duree_heures):
+    """Crée un code signé, vérifiable sans base de données."""
+    expiration = int(time.time()) + int(duree_heures * 3600)
+
+    expiration_minutes = expiration // 60
+    bloc_expiration = _base36_encode(expiration_minutes).rjust(6, "0")[-6:]
+
+    nonce = base64.b32encode(secrets.token_bytes(3)).decode("ascii").rstrip("=")
+    nonce = nonce[:5]
+
+    message = f"{bloc_expiration}{nonce}".encode("ascii")
+    signature = hmac.new(
+        _secret_token(),
+        message,
+        hashlib.sha256
+    ).digest()[:5]
+
+    bloc_signature = base64.b32encode(signature).decode("ascii").rstrip("=")
+    code = f"{bloc_expiration}{nonce}{bloc_signature}"
+
+    expiration_reelle = expiration_minutes * 60 + 59
+    return _formater_code_temporaire(code), expiration_reelle
+
+
+def verifier_code_temporaire(code):
+    """Retourne (valide, expiration, message)."""
+    brut = _normaliser_code_temporaire(code)
+
+    if len(brut) != 19:
+        return False, 0, "Code élèves invalide."
+
+    bloc_expiration = brut[:6]
+    nonce = brut[6:11]
+    signature_fournie = brut[11:]
+
+    try:
+        expiration_minutes = _base36_decode(bloc_expiration)
+    except ValueError:
+        return False, 0, "Code élèves invalide."
+
+    message = f"{bloc_expiration}{nonce}".encode("ascii")
+    signature = hmac.new(
+        _secret_token(),
+        message,
+        hashlib.sha256
+    ).digest()[:5]
+    signature_attendue = base64.b32encode(signature).decode("ascii").rstrip("=")
+
+    if not hmac.compare_digest(signature_fournie, signature_attendue):
+        return False, 0, "Code élèves invalide."
+
+    expiration = expiration_minutes * 60 + 59
+
+    if time.time() > expiration:
+        return False, expiration, "Ce code élèves a expiré."
+
+    return True, expiration, ""
+
+
+def heure_locale(timestamp):
+    return datetime.fromtimestamp(timestamp, tz=PARIS).strftime("%H:%M")
+
 
 if "acces_autorise" not in st.session_state:
     st.session_state.acces_autorise = False
+
+if "acces_expire_at" not in st.session_state:
+    st.session_state.acces_expire_at = 0
+
+if "professeur_autorise" not in st.session_state:
+    st.session_state.professeur_autorise = False
+
+if "code_temporaire_genere" not in st.session_state:
+    st.session_state.code_temporaire_genere = ""
+
+if "code_temporaire_expiration" not in st.session_state:
+    st.session_state.code_temporaire_expiration = 0
+
+if "mode_acces" not in st.session_state:
+    st.session_state.mode_acces = ""
+
+if "message_expiration" not in st.session_state:
+    st.session_state.message_expiration = ""
+
+
+# Un élève déjà connecté est automatiquement déconnecté à l'expiration.
+if (
+    st.session_state.acces_autorise
+    and st.session_state.acces_expire_at
+    and time.time() > st.session_state.acces_expire_at
+):
+    st.session_state.acces_autorise = False
+    st.session_state.acces_expire_at = 0
+    st.session_state.message_expiration = (
+        "Ton accès a expiré. Demande un nouveau code à ton professeur."
+    )
+
 
 if not st.session_state.acces_autorise:
 
     st.title("🎙️ Coach d'écriture Radio ISTJ")
 
-    st.write(
-        "Entre le code d'accès donné par ton professeur "
-        "pour utiliser le Coach."
-    )
+    if st.session_state.message_expiration:
+        st.warning(st.session_state.message_expiration)
+        st.session_state.message_expiration = ""
 
-    code_saisi = st.text_input(
-        "Code d'accès",
-        type="password"
-    )
+    if not st.session_state.mode_acces:
+        st.caption("Choisis ton espace pour continuer.")
 
-    if st.button("Entrer", use_container_width=True):
+        col_eleve, col_prof = st.columns(2)
 
-        try:
-            code_attendu = str(st.secrets["ACCESS_CODE"]).strip()
-        except Exception:
-            st.error(
-                "Le code d'accès n'est pas configuré. "
-                "Préviens ton professeur."
-            )
-            st.stop()
+        with col_eleve:
+            st.subheader("🎓 Élève")
+            st.write("J'entre avec le code temporaire de ma séance.")
+            if st.button("Accès élève", use_container_width=True):
+                st.session_state.mode_acces = "eleve"
+                st.rerun()
 
-        if code_saisi.strip() == code_attendu:
-            st.session_state.acces_autorise = True
+        with col_prof:
+            st.subheader("👩‍🏫 Professeur")
+            st.write("Je peux créer un accès temporaire pour ma classe.")
+            if st.button("Accès professeur", use_container_width=True):
+                st.session_state.mode_acces = "professeur"
+                st.rerun()
+
+    elif st.session_state.mode_acces == "eleve":
+
+        if st.button("← Changer de profil"):
+            st.session_state.mode_acces = ""
             st.rerun()
+
+        st.subheader("🎓 Accès élève")
+        st.write(
+            "Entre le code temporaire donné par ton professeur "
+            "pour utiliser le Coach."
+        )
+
+        code_saisi = st.text_input(
+            "Code élèves",
+            placeholder="XXXX-XXXX-XXXX-XXXX-XXX"
+        )
+
+        if st.button("Entrer", use_container_width=True):
+            try:
+                valide, expiration, message = verifier_code_temporaire(code_saisi)
+            except RuntimeError as e:
+                st.error(str(e))
+                st.stop()
+
+            if valide:
+                st.session_state.acces_autorise = True
+                st.session_state.acces_expire_at = expiration
+                st.rerun()
+            else:
+                st.error(message)
+
+    else:
+
+        if not st.session_state.professeur_autorise:
+
+            if st.button("← Changer de profil"):
+                st.session_state.mode_acces = ""
+                st.rerun()
+
+            st.subheader("👩‍🏫 Accès professeur")
+            st.caption(
+                "Le code professeur est permanent et ne doit pas être communiqué "
+                "aux élèves."
+            )
+
+            code_professeur = st.text_input(
+                "Code professeur",
+                type="password"
+            )
+
+            if st.button("Ouvrir l'espace professeur", use_container_width=True):
+                try:
+                    code_attendu = str(st.secrets["TEACHER_CODE"]).strip()
+                except Exception:
+                    code_attendu = ""
+
+                if not code_attendu:
+                    st.error(
+                        "TEACHER_CODE n'est pas configuré dans les Secrets Streamlit."
+                    )
+                elif hmac.compare_digest(code_professeur.strip(), code_attendu):
+                    st.session_state.professeur_autorise = True
+                    st.rerun()
+                else:
+                    st.error("Code professeur incorrect.")
+
         else:
-            st.error("Code d'accès incorrect.")
+
+            st.subheader("👩‍🏫 Espace professeur")
+            st.write(
+                "Génère un code à communiquer aux élèves au début de la séance."
+            )
+
+            duree = st.radio(
+                "Durée de validité",
+                ["1 heure", "2 heures"],
+                horizontal=True
+            )
+
+            if st.button("🔑 Générer un nouveau code élèves", use_container_width=True):
+                try:
+                    code, expiration = generer_code_temporaire(
+                        1 if duree == "1 heure" else 2
+                    )
+                except RuntimeError as e:
+                    st.error(str(e))
+                else:
+                    st.session_state.code_temporaire_genere = code
+                    st.session_state.code_temporaire_expiration = expiration
+
+            if st.session_state.code_temporaire_genere:
+                st.success("Code élèves prêt")
+                st.code(st.session_state.code_temporaire_genere, language=None)
+                st.write(
+                    "**Valable jusqu'à "
+                    f"{heure_locale(st.session_state.code_temporaire_expiration)}**"
+                )
+                st.caption(
+                    "Tu peux écrire ce code au tableau. Il deviendra "
+                    "automatiquement inutilisable après l'heure indiquée."
+                )
+
+            st.divider()
+
+            if st.button("Fermer l'espace professeur"):
+                st.session_state.professeur_autorise = False
+                st.session_state.code_temporaire_genere = ""
+                st.session_state.code_temporaire_expiration = 0
+                st.session_state.mode_acces = ""
+                st.rerun()
 
     st.stop()
 
