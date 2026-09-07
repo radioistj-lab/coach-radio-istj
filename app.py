@@ -152,6 +152,56 @@ def heure_locale(timestamp):
     return datetime.fromtimestamp(timestamp, tz=PARIS).strftime("%H:%M")
 
 
+def afficher_carte_role(emoji, titre, sous_titre, couleur="#153A63"):
+    st.markdown(
+        f"""
+        <div style="
+            border: 1px solid #dfe5ec;
+            border-radius: 18px;
+            padding: 28px 16px 22px 16px;
+            text-align: center;
+            background: #ffffff;
+            min-height: 340px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        ">
+            <div style="font-size: 7rem; line-height: 1; margin-bottom: 24px;">
+                {emoji}
+            </div>
+            <div style="font-size: 1.55rem; font-weight: 700; color: {couleur}; margin-top: 4px;">
+                {titre}
+            </div>
+            <div style="font-size: 0.95rem; color: #555555; margin-top: 12px;">
+                {sous_titre}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+def afficher_pied_page_application():
+    st.markdown(
+        """
+        <div style="
+            margin-top: 3rem;
+            padding-top: 1rem;
+            border-top: 1px solid #e6e6e6;
+            text-align: center;
+            color: #777777;
+            font-size: 0.82rem;
+            line-height: 1.5;
+        ">
+            <strong>Coach d’écriture Radio ISTJ</strong><br>
+            © 2026 C. Declerck — Tous droits réservés
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
 if "acces_autorise" not in st.session_state:
     st.session_state.acces_autorise = False
 
@@ -190,40 +240,64 @@ if (
 if not st.session_state.acces_autorise:
 
     st.title("🎙️ Coach d'écriture Radio ISTJ")
+    st.caption("Choisis ton espace pour continuer.")
 
     if st.session_state.message_expiration:
         st.warning(st.session_state.message_expiration)
         st.session_state.message_expiration = ""
 
+    # -----------------------------------------------------
+    # CHOIX DU PROFIL
+    # -----------------------------------------------------
     if not st.session_state.mode_acces:
-        st.caption("Choisis ton espace pour continuer.")
 
-        col_eleve, col_prof = st.columns(2)
+        col_eleve, col_prof = st.columns(2, gap="large")
 
         with col_eleve:
-            st.subheader("🎓 Élève")
-            st.write("J'entre avec le code temporaire de ma séance.")
-            if st.button("Accès élève", use_container_width=True):
+            afficher_carte_role(
+                "🎙️",
+                "Élève",
+                "J'entre avec le code de ma séance.",
+                "#153A63"
+            )
+            if st.button(
+                "Entrer comme élève",
+                key="choisir_eleve",
+                use_container_width=True
+            ):
                 st.session_state.mode_acces = "eleve"
                 st.rerun()
 
         with col_prof:
-            st.subheader("👩‍🏫 Professeur")
-            st.write("Je peux créer un accès temporaire pour ma classe.")
-            if st.button("Accès professeur", use_container_width=True):
+            afficher_carte_role(
+                "👩‍🏫",
+                "Professeur",
+                "Je crée un accès pour mon groupe.",
+                "#4E8B45"
+            )
+            if st.button(
+                "Entrer comme professeur",
+                key="choisir_professeur",
+                use_container_width=True
+            ):
                 st.session_state.mode_acces = "professeur"
                 st.rerun()
 
+    # -----------------------------------------------------
+    # ESPACE ÉLÈVE
+    # -----------------------------------------------------
     elif st.session_state.mode_acces == "eleve":
 
-        if st.button("← Changer de profil"):
-            st.session_state.mode_acces = ""
-            st.rerun()
+        col_retour, _ = st.columns([1, 3])
+        with col_retour:
+            if st.button("← Changer de profil"):
+                st.session_state.mode_acces = ""
+                st.rerun()
 
-        st.subheader("🎓 Accès élève")
+        st.subheader("🎙️ Accès élève")
         st.write(
             "Entre le code temporaire donné par ton professeur "
-            "pour utiliser le Coach."
+            "pour utiliser le Coach Radio ISTJ."
         )
 
         code_saisi = st.text_input(
@@ -236,6 +310,7 @@ if not st.session_state.acces_autorise:
                 valide, expiration, message = verifier_code_temporaire(code_saisi)
             except RuntimeError as e:
                 st.error(str(e))
+                afficher_pied_page_application()
                 st.stop()
 
             if valide:
@@ -245,13 +320,18 @@ if not st.session_state.acces_autorise:
             else:
                 st.error(message)
 
+    # -----------------------------------------------------
+    # ESPACE PROFESSEUR
+    # -----------------------------------------------------
     else:
 
         if not st.session_state.professeur_autorise:
 
-            if st.button("← Changer de profil"):
-                st.session_state.mode_acces = ""
-                st.rerun()
+            col_retour, _ = st.columns([1, 3])
+            with col_retour:
+                if st.button("← Changer de profil"):
+                    st.session_state.mode_acces = ""
+                    st.rerun()
 
             st.subheader("👩‍🏫 Accès professeur")
             st.caption(
@@ -325,8 +405,8 @@ if not st.session_state.acces_autorise:
                 st.session_state.mode_acces = ""
                 st.rerun()
 
+    afficher_pied_page_application()
     st.stop()
-
 
 
 # =========================================================
