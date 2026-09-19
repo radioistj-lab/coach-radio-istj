@@ -1,5 +1,6 @@
 import io
 import html
+import json
 import base64
 import hashlib
 import hmac
@@ -10,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 from openai import OpenAI
+from upstash_redis import Redis
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
@@ -440,6 +442,379 @@ if not st.session_state.acces_autorise:
 def initialiser(cle, valeur=""):
     if cle not in st.session_state:
         st.session_state[cle] = valeur
+
+
+# ---------------------------------------------------------
+# SAUVEGARDE DES PROJETS ÉLÈVES
+# ---------------------------------------------------------
+
+PROJET_PREFIXE = "coach_radio:project:"
+PROJET_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+PROJET_CODE_LONGUEUR = 10
+PROJET_WIDGET_PREFIX = "_coach_radio_widget_"
+
+
+def _redis_projets():
+    """Connexion paresseuse à Upstash pour ne pas bloquer l'écran d'accès."""
+    try:
+        url = str(st.secrets["UPSTASH_REDIS_REST_URL"]).strip()
+        token = str(st.secrets["UPSTASH_REDIS_REST_TOKEN"]).strip()
+    except Exception:
+        url = ""
+        token = ""
+
+    if not url or not token:
+        raise RuntimeError(
+            "La sauvegarde des projets n'est pas encore configurée. "
+            "Les secrets UPSTASH_REDIS_REST_URL et "
+            "UPSTASH_REDIS_REST_TOKEN doivent être ajoutés à l'application."
+        )
+
+    return Redis(url=url, token=token)
+
+
+def normaliser_code_projet(code):
+    return "".join(
+        caractere for caractere in str(code).upper()
+        if caractere.isalnum()
+    )
+
+
+def formater_code_projet(code):
+    brut = normaliser_code_projet(code)
+    return "-".join(
+        brut[i:i + 5]
+        for i in range(0, len(brut), 5)
+    )
+
+
+def cle_projet(code):
+    return f"{PROJET_PREFIXE}{normaliser_code_projet(code)}"
+
+
+def vider_widgets_projet():
+    for cle in list(st.session_state.keys()):
+        if str(cle).startswith(PROJET_WIDGET_PREFIX):
+            del st.session_state[cle]
+
+
+def cle_widget_projet(champ):
+    return f"{PROJET_WIDGET_PREFIX}{champ}"
+
+
+def synchroniser_widgets_projet():
+    """Copie les valeurs visibles des champs vers l'état du projet."""
+    for champ in globals().get("CHAMPS_PROJET", []):
+        cle_widget = cle_widget_projet(champ)
+        if cle_widget in st.session_state:
+            st.session_state[champ] = st.session_state[cle_widget]
+
+
+def champ_texte_projet(champ, etiquette, multiline=False, **kwargs):
+    """Champ Streamlit relié à un champ sauvegardable du projet."""
+    cle_widget = cle_widget_projet(champ)
+
+    if cle_widget not in st.session_state:
+        st.session_state[cle_widget] = st.session_state.get(champ, "")
+
+    if multiline:
+        valeur = st.text_area(
+            etiquette,
+            key=cle_widget,
+            **kwargs
+        )
+    else:
+        valeur = st.text_input(
+            etiquette,
+            key=cle_widget,
+            **kwargs
+        )
+
+    st.session_state[champ] = valeur
+    return valeur
+
+
+def radio_projet(champ, etiquette, options, **kwargs):
+    cle_widget = cle_widget_projet(champ)
+    valeur_actuelle = st.session_state.get(champ, options[0])
+
+    if valeur_actuelle not in options:
+        valeur_actuelle = options[0]
+
+    if cle_widget not in st.session_state:
+        st.session_state[cle_widget] = valeur_actuelle
+
+    valeur = st.radio(
+        etiquette,
+        options,
+        key=cle_widget,
+        **kwargs
+    )
+
+    st.session_state[champ] = valeur
+    return valeur
+
+
+def signature_contenu_projet():
+    synchroniser_widgets_projet()
+
+    contenu = {
+        champ: st.session_state.get(champ, PROJET_DEFAUTS.get(champ, ""))
+        for champ in CHAMPS_PROJET
+    }
+
+    texte = json.dumps(
+        contenu,
+        ensure_ascii=False,
+        sort_keys=True
+    )
+
+    return hashlib.sha256(texte.encode("utf-8")).hexdigest()
+
+
+def payload_projet():
+    synchroniser_widgets_projet()
+    maintenant = datetime.now(PARIS)
+
+    return {
+        "version": 1,
+        "code": st.session_state.projet_code,
+        "eleve": {
+            "prenom": st.session_state.projet_prenom,
+            "nom": st.session_state.projet_nom,
+            "classe": st.session_state.projet_classe,
+        },
+        "created_at": st.session_state.projet_created_at,
+        "updated_at": maintenant.isoformat(),
+        "data": {
+            champ: st.session_state.get(
+                champ,
+                PROJET_DEFAUTS.get(champ, "")
+            )
+            for champ in CHAMPS_PROJET
+        }
+    }
+
+
+def sauvegarder_projet(afficher_message=False):
+    if not st.session_state.get("projet_actif"):
+        return False
+
+    code = st.session_state.get("projet_code", "")
+    if not code:
+        return False
+
+    try:
+        client = _redis_projets()
+        donnees = payload_projet()
+        client.set(
+            cle_projet(code),
+            json.dumps(donnees, ensure_ascii=False)
+        )
+    except Exception as exc:
+        if afficher_message:
+            st.error(f"Impossible de sauvegarder le projet : {exc}")
+        return False
+
+    maintenant = datetime.now(PARIS)
+    st.session_state.projet_derniere_sauvegarde = maintenant.strftime(
+        "%d/%m/%Y à %H:%M"
+    )
+    st.session_state.projet_signature_sauvegardee = signature_contenu_projet()
+
+    if afficher_message:
+        st.success("💾 Travail sauvegardé.")
+
+    return True
+
+
+def autosauvegarder_projet_si_necessaire():
+    if not st.session_state.get("projet_actif"):
+        return
+
+    try:
+        signature = signature_contenu_projet()
+    except Exception:
+        return
+
+    precedente = st.session_state.get("projet_signature_sauvegardee", "")
+
+    if precedente and signature != precedente:
+        sauvegarder_projet(afficher_message=False)
+
+
+def reinitialiser_contenu_projet():
+    for champ, valeur in PROJET_DEFAUTS.items():
+        st.session_state[champ] = valeur
+
+    vider_widgets_projet()
+
+
+def generer_code_projet():
+    client = _redis_projets()
+
+    for _ in range(20):
+        brut = "".join(
+            secrets.choice(PROJET_CODE_ALPHABET)
+            for _ in range(PROJET_CODE_LONGUEUR)
+        )
+        code = formater_code_projet(brut)
+
+        if not client.exists(cle_projet(code)):
+            return code
+
+    raise RuntimeError(
+        "Impossible de créer un code de projet unique. Réessaie."
+    )
+
+
+def creer_nouveau_projet(prenom, nom, classe):
+    prenom = " ".join(str(prenom).split())
+    nom = " ".join(str(nom).split())
+    classe = " ".join(str(classe).upper().split())
+
+    if not prenom or not nom or not classe:
+        return False, "Complète ton prénom, ton nom et ta classe."
+
+    try:
+        code = generer_code_projet()
+    except Exception as exc:
+        return False, str(exc)
+
+    reinitialiser_contenu_projet()
+
+    st.session_state.projet_code = code
+    st.session_state.projet_prenom = prenom
+    st.session_state.projet_nom = nom
+    st.session_state.projet_classe = classe
+    st.session_state.projet_created_at = datetime.now(PARIS).isoformat()
+    st.session_state.projet_actif = True
+    st.session_state.projet_derniere_sauvegarde = ""
+    st.session_state.projet_signature_sauvegardee = ""
+
+    if not sauvegarder_projet(afficher_message=False):
+        st.session_state.projet_actif = False
+        return False, "La sauvegarde du projet n'a pas pu être créée."
+
+    st.session_state.projet_message_creation = True
+    return True, ""
+
+
+def charger_projet(code):
+    brut = normaliser_code_projet(code)
+
+    if len(brut) != PROJET_CODE_LONGUEUR:
+        return False, "Code de projet invalide."
+
+    try:
+        client = _redis_projets()
+        valeur = client.get(cle_projet(brut))
+    except Exception as exc:
+        return False, f"Impossible d'accéder aux sauvegardes : {exc}"
+
+    if not valeur:
+        return False, "Aucun projet ne correspond à ce code."
+
+    try:
+        if isinstance(valeur, bytes):
+            valeur = valeur.decode("utf-8")
+        donnees = valeur if isinstance(valeur, dict) else json.loads(valeur)
+    except Exception:
+        return False, "Cette sauvegarde est illisible."
+
+    reinitialiser_contenu_projet()
+
+    data = donnees.get("data", {})
+    for champ, valeur_defaut in PROJET_DEFAUTS.items():
+        st.session_state[champ] = data.get(champ, valeur_defaut)
+
+    eleve = donnees.get("eleve", {})
+    st.session_state.projet_code = formater_code_projet(brut)
+    st.session_state.projet_prenom = str(eleve.get("prenom", "")).strip()
+    st.session_state.projet_nom = str(eleve.get("nom", "")).strip()
+    st.session_state.projet_classe = str(eleve.get("classe", "")).strip()
+    st.session_state.projet_created_at = str(donnees.get("created_at", ""))
+    st.session_state.projet_actif = True
+
+    updated_at = str(donnees.get("updated_at", "")).strip()
+    if updated_at:
+        try:
+            date_sauvegarde = datetime.fromisoformat(updated_at)
+            if date_sauvegarde.tzinfo is None:
+                date_sauvegarde = date_sauvegarde.replace(tzinfo=PARIS)
+            date_sauvegarde = date_sauvegarde.astimezone(PARIS)
+            st.session_state.projet_derniere_sauvegarde = (
+                date_sauvegarde.strftime("%d/%m/%Y à %H:%M")
+            )
+        except Exception:
+            st.session_state.projet_derniere_sauvegarde = ""
+    else:
+        st.session_state.projet_derniere_sauvegarde = ""
+
+    vider_widgets_projet()
+    st.session_state.projet_signature_sauvegardee = signature_contenu_projet()
+    return True, ""
+
+
+def fermer_projet():
+    sauvegarder_projet(afficher_message=False)
+    st.session_state.projet_actif = False
+    st.session_state.projet_code = ""
+    st.session_state.projet_prenom = ""
+    st.session_state.projet_nom = ""
+    st.session_state.projet_classe = ""
+    st.session_state.projet_created_at = ""
+    st.session_state.projet_derniere_sauvegarde = ""
+    st.session_state.projet_signature_sauvegardee = ""
+    st.session_state.projet_message_creation = False
+    vider_widgets_projet()
+
+
+def afficher_sidebar_projet():
+    if not st.session_state.get("projet_actif"):
+        return
+
+    with st.sidebar:
+        st.subheader("💾 Mon projet")
+
+        identite = " ".join(
+            morceau for morceau in [
+                st.session_state.projet_prenom,
+                st.session_state.projet_nom
+            ]
+            if morceau
+        )
+
+        if identite:
+            st.write(f"**{identite}**")
+        if st.session_state.projet_classe:
+            st.caption(f"Classe : {st.session_state.projet_classe}")
+
+        st.caption("Code pour reprendre ce travail")
+        st.code(st.session_state.projet_code, language=None)
+
+        if st.session_state.projet_derniere_sauvegarde:
+            st.caption(
+                "Dernière sauvegarde : "
+                f"{st.session_state.projet_derniere_sauvegarde}"
+            )
+
+        if st.button(
+            "💾 Sauvegarder maintenant",
+            key="projet_sauvegarder_maintenant",
+            use_container_width=True
+        ):
+            sauvegarder_projet(afficher_message=True)
+
+        if st.button(
+            "Fermer ce projet",
+            key="projet_fermer",
+            use_container_width=True
+        ):
+            fermer_projet()
+            st.rerun()
+
+        st.divider()
 
 
 def appel_ia(instructions, contenu):
@@ -1111,6 +1486,153 @@ initialiser("chronique")
 initialiser("feedback_final")
 
 
+# Métadonnées du projet sauvegardé
+initialiser("projet_actif", False)
+initialiser("projet_code", "")
+initialiser("projet_prenom", "")
+initialiser("projet_nom", "")
+initialiser("projet_classe", "")
+initialiser("projet_created_at", "")
+initialiser("projet_derniere_sauvegarde", "")
+initialiser("projet_signature_sauvegardee", "")
+initialiser("projet_message_creation", False)
+
+
+PROJET_DEFAUTS = {
+    "etape": "accueil",
+    "parcours": "",
+    "niveau": "6e-5e",
+    "nombre_voix": "1 voix",
+    "source": "",
+    "sujet": "",
+    "idees": "",
+    "vocabulaire": "",
+    "feedback_comprehension": "",
+    "libre_theme": "",
+    "libre_sujet": "",
+    "libre_angle": "",
+    "feedback_angle": "",
+    "libre_recherches": "",
+    "libre_infos": "",
+    "feedback_recherches": "",
+    "libre_what": "",
+    "libre_who": "",
+    "libre_where": "",
+    "libre_when": "",
+    "libre_whyhow": "",
+    "plan_introduction": "",
+    "plan_developpement": "",
+    "plan_conclusion": "",
+    "plan_repartition": "",
+    "feedback_plan": "",
+    "introduction": "",
+    "feedback_introduction": "",
+    "developpement": "",
+    "feedback_developpement": "",
+    "conclusion": "",
+    "feedback_conclusion": "",
+    "ref_auteur": "",
+    "ref_titre": "",
+    "ref_media": "",
+    "ref_date": "",
+    "libre_references": "",
+    "feedback_references": "",
+    "chronique": "",
+    "feedback_final": "",
+}
+
+CHAMPS_PROJET = list(PROJET_DEFAUTS.keys())
+
+
+# =========================================================
+# CHOIX / REPRISE D'UN PROJET ÉLÈVE
+# =========================================================
+
+if not st.session_state.projet_actif:
+    st.title("🎙️ Coach d'écriture Radio ISTJ")
+    st.subheader("💾 Ton travail")
+    st.write(
+        "Commence un nouveau projet ou reprends un travail déjà sauvegardé."
+    )
+
+    onglet_nouveau, onglet_reprendre = st.tabs([
+        "➕ Nouveau projet",
+        "↩️ Reprendre un projet"
+    ])
+
+    with onglet_nouveau:
+        st.write(
+            "Ces informations servent uniquement à retrouver et identifier "
+            "ton travail dans le Coach Radio."
+        )
+
+        nouveau_prenom = st.text_input(
+            "Prénom",
+            key="projet_nouveau_prenom"
+        )
+        nouveau_nom = st.text_input(
+            "Nom",
+            key="projet_nouveau_nom"
+        )
+        nouveau_classe = st.text_input(
+            "Classe",
+            placeholder="Ex. 5B",
+            key="projet_nouveau_classe"
+        )
+
+        if st.button(
+            "Créer mon projet",
+            key="projet_creer",
+            use_container_width=True
+        ):
+            ok, message = creer_nouveau_projet(
+                nouveau_prenom,
+                nouveau_nom,
+                nouveau_classe
+            )
+
+            if ok:
+                st.rerun()
+            else:
+                st.error(message)
+
+    with onglet_reprendre:
+        st.write(
+            "Entre le code de reprise donné lors de la création du projet."
+        )
+
+        code_reprise = st.text_input(
+            "Code de reprise",
+            placeholder="XXXXX-XXXXX",
+            key="projet_code_reprise"
+        )
+
+        if st.button(
+            "Reprendre mon travail",
+            key="projet_reprendre",
+            use_container_width=True
+        ):
+            ok, message = charger_projet(code_reprise)
+
+            if ok:
+                st.rerun()
+            else:
+                st.error(message)
+
+    st.info(
+        "Le code de reprise est différent du code temporaire qui permet "
+        "d'entrer dans le Coach. Garde-le pour retrouver ton travail "
+        "à la prochaine séance."
+    )
+
+    afficher_pied_page_application()
+    st.stop()
+
+
+# Toute modification déjà présente dans les widgets est synchronisée et,
+# si nécessaire, sauvegardée automatiquement.
+autosauvegarder_projet_si_necessaire()
+
 # =========================================================
 # RÈGLES COMMUNES DE RÉDACTION
 # =========================================================
@@ -1269,7 +1791,16 @@ Cherche un seuil suffisant pour une chronique radio de collège.
 
 st.title("🎙️ Coach d'écriture Radio ISTJ")
 
+afficher_sidebar_projet()
 afficher_sidebar_libre()
+
+if st.session_state.projet_message_creation:
+    st.success(
+        "✅ Ton projet est créé et sauvegardé. "
+        "Note bien le code de reprise affiché dans la colonne de gauche."
+    )
+    st.session_state.projet_message_creation = False
+
 
 
 # =========================================================
@@ -1284,13 +1815,15 @@ if st.session_state.etape == "accueil":
 
     st.divider()
 
-    niveau = st.radio(
+    niveau = radio_projet(
+        "niveau",
         "Quel est ton niveau ?",
         ["6e-5e", "4e-3e"],
         horizontal=True
     )
 
-    nombre_voix = st.radio(
+    nombre_voix = radio_projet(
+        "nombre_voix",
         "Combien de voix pour la chronique ?",
         ["1 voix", "2 voix", "3 voix"],
         horizontal=True
@@ -1316,8 +1849,10 @@ if st.session_state.etape == "accueil":
             "et rédiger ta chronique."
         )
 
-        source = st.text_area(
+        source = champ_texte_projet(
+            "source",
             "Colle ici l'article ou la source :",
+            multiline=True,
             height=300
         )
 
@@ -1370,21 +1905,24 @@ elif st.session_state.etape == "comprehension":
         f"**Format :** {st.session_state.nombre_voix}"
     )
 
-    sujet = st.text_area(
+    sujet = champ_texte_projet(
+        "sujet",
         "Quel est le sujet principal ?",
-        value=st.session_state.sujet
+        multiline=True
     )
 
-    idees = st.text_area(
+    idees = champ_texte_projet(
+        "idees",
         "Quelles sont les 2 ou 3 idées importantes ?",
-        value=st.session_state.idees,
+        multiline=True,
         height=160
     )
 
-    vocabulaire = st.text_area(
+    vocabulaire = champ_texte_projet(
+        "vocabulaire",
         "Y a-t-il un mot ou un passage que tu ne comprends pas ? "
         "Si tout est clair, écris : Aucun.",
-        value=st.session_state.vocabulaire
+        multiline=True
     )
 
     if st.button("Continuer"):
@@ -1560,20 +2098,21 @@ elif st.session_state.etape == "libre_cadrage":
             "Choisir un angle, c'est choisir l'essentiel."
         )
 
-    libre_theme = st.text_input(
-        "Quel est ton thème général ?",
-        value=st.session_state.libre_theme
+    libre_theme = champ_texte_projet(
+        "libre_theme",
+        "Quel est ton thème général ?"
     )
 
-    libre_sujet = st.text_input(
-        "Quel sujet précis veux-tu traiter ?",
-        value=st.session_state.libre_sujet
+    libre_sujet = champ_texte_projet(
+        "libre_sujet",
+        "Quel sujet précis veux-tu traiter ?"
     )
 
-    libre_angle = st.text_area(
+    libre_angle = champ_texte_projet(
+        "libre_angle",
         "Quel angle veux-tu choisir ? "
         "Qu'est-ce que tu veux surtout faire comprendre ou découvrir ?",
-        value=st.session_state.libre_angle,
+        multiline=True,
         height=120
     )
 
@@ -1803,15 +2342,17 @@ elif st.session_state.etape == "libre_recherches":
         "et indique d'où elles viennent."
     )
 
-    libre_recherches = st.text_area(
+    libre_recherches = champ_texte_projet(
+        "libre_recherches",
         "Mes recherches et mes sources :",
-        value=st.session_state.libre_recherches,
+        multiline=True,
         height=320
     )
 
-    libre_infos = st.text_area(
+    libre_infos = champ_texte_projet(
+        "libre_infos",
         "Quelles informations veux-tu surtout retenir pour ta chronique ?",
-        value=st.session_state.libre_infos,
+        multiline=True,
         height=180
     )
 
@@ -1992,30 +2533,35 @@ elif st.session_state.etape == "libre_5w":
         "« Pas nécessaire pour mon angle »."
     )
 
-    libre_what = st.text_area(
+    libre_what = champ_texte_projet(
+        "libre_what",
         "WHAT ? De quoi parle précisément ta chronique ?",
-        value=st.session_state.libre_what
+        multiline=True
     )
 
-    libre_who = st.text_area(
+    libre_who = champ_texte_projet(
+        "libre_who",
         "WHO ? Qui est concerné ?",
-        value=st.session_state.libre_who
+        multiline=True
     )
 
-    libre_where = st.text_area(
+    libre_where = champ_texte_projet(
+        "libre_where",
         "WHERE ? Où cela se passe-t-il ?",
-        value=st.session_state.libre_where
+        multiline=True
     )
 
-    libre_when = st.text_area(
+    libre_when = champ_texte_projet(
+        "libre_when",
         "WHEN ? Quand cela se passe-t-il ?",
-        value=st.session_state.libre_when
+        multiline=True
     )
 
-    libre_whyhow = st.text_area(
+    libre_whyhow = champ_texte_projet(
+        "libre_whyhow",
         "WHY / HOW ? Pourquoi ce sujet est-il intéressant ? "
         "Que veux-tu expliquer ou faire comprendre ?",
-        value=st.session_state.libre_whyhow,
+        multiline=True,
         height=130
     )
 
@@ -2075,28 +2621,32 @@ elif st.session_state.etape == "plan":
             "Tu n'écris pas encore les phrases."
         )
 
-    plan_introduction = st.text_area(
+    plan_introduction = champ_texte_projet(
+        "plan_introduction",
         "Introduction — Que veux-tu faire au début ?",
-        value=st.session_state.plan_introduction
+        multiline=True
     )
 
-    plan_developpement = st.text_area(
+    plan_developpement = champ_texte_projet(
+        "plan_developpement",
         "Développement — Quelles idées veux-tu présenter, et dans quel ordre ?",
-        value=st.session_state.plan_developpement,
+        multiline=True,
         height=180
     )
 
-    plan_conclusion = st.text_area(
+    plan_conclusion = champ_texte_projet(
+        "plan_conclusion",
         "Conclusion — Sur quelle idée veux-tu terminer ?",
-        value=st.session_state.plan_conclusion
+        multiline=True
     )
 
     if st.session_state.nombre_voix != "1 voix":
 
-        plan_repartition = st.text_area(
+        plan_repartition = champ_texte_projet(
+            "plan_repartition",
             f"Répartition des {st.session_state.nombre_voix} — "
             "Qui intervient dans les différentes parties ?",
-            value=st.session_state.plan_repartition,
+            multiline=True,
             height=140
         )
 
@@ -2315,9 +2865,10 @@ elif st.session_state.etape == "introduction":
         st.session_state.plan_introduction
     )
 
-    introduction = st.text_area(
+    introduction = champ_texte_projet(
+        "introduction",
         "Ton introduction :",
-        value=st.session_state.introduction,
+        multiline=True,
         height=180
     )
 
@@ -2505,9 +3056,10 @@ elif st.session_state.etape == "developpement":
             st.session_state.plan_repartition
         )
 
-    developpement = st.text_area(
+    developpement = champ_texte_projet(
+        "developpement",
         "Ton développement :",
-        value=st.session_state.developpement,
+        multiline=True,
         height=340
     )
 
@@ -2903,9 +3455,10 @@ elif st.session_state.etape == "conclusion":
         st.session_state.plan_conclusion
     )
 
-    conclusion = st.text_area(
+    conclusion = champ_texte_projet(
+        "conclusion",
         "Ta conclusion :",
-        value=st.session_state.conclusion,
+        multiline=True,
         height=180
     )
 
@@ -3215,24 +3768,24 @@ elif st.session_state.etape == "references":
             "écris « Non indiqué »."
         )
 
-        ref_auteur = st.text_input(
-            "Auteur :",
-            value=st.session_state.ref_auteur
+        ref_auteur = champ_texte_projet(
+            "ref_auteur",
+            "Auteur :"
         )
 
-        ref_titre = st.text_input(
-            "Titre :",
-            value=st.session_state.ref_titre
+        ref_titre = champ_texte_projet(
+            "ref_titre",
+            "Titre :"
         )
 
-        ref_media = st.text_input(
-            "Média :",
-            value=st.session_state.ref_media
+        ref_media = champ_texte_projet(
+            "ref_media",
+            "Média :"
         )
 
-        ref_date = st.text_input(
-            "Date :",
-            value=st.session_state.ref_date
+        ref_date = champ_texte_projet(
+            "ref_date",
+            "Date :"
         )
 
         if st.button("Enregistrer mes références"):
@@ -3281,9 +3834,10 @@ elif st.session_state.etape == "references":
             "présentée comme une source utilisée."
         )
 
-        libre_references = st.text_area(
+        libre_references = champ_texte_projet(
+            "libre_references",
             "Mes sources utilisées :",
-            value=st.session_state.libre_references,
+            multiline=True,
             height=220,
             placeholder=(
                 "Exemples :\n"
