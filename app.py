@@ -182,28 +182,57 @@ def _cle_code_court(code):
     return f"coach_radio:short_access:v3:{digest}"
 
 
-def generer_acces_court(duree_heures, mode="collectif", prenom="", nom="", classe=""):
-    duree_heures = int(duree_heures)
-    if duree_heures not in (1, 2):
-        raise ValueError("Durée non autorisée.")
+def generer_acces_court(duree_heures=None, mode="collectif", prenom="", nom="", classe="", debut=None, fin=None):
+    """Réserve un code court pour une plage [debut, fin] en timestamps Unix."""
     if mode not in ("collectif", "individuel"):
         raise ValueError("Mode d'accès inconnu.")
     prenom, nom, classe = (" ".join(str(v).split()) for v in (prenom, nom, classe))
     if mode == "individuel" and not all((prenom, nom, classe)):
         raise ValueError("Renseigne le prénom, le nom et la classe.")
-    expiration = int(time.time()) + duree_heures * 3600
+    maintenant = int(time.time())
+    if debut is None and fin is None:
+        if int(duree_heures or 0) not in (1, 2):
+            raise ValueError("Durée non autorisée.")
+        debut = maintenant
+        fin = maintenant + int(duree_heures) * 3600
+    elif debut is None or fin is None:
+        raise ValueError("Renseigne le début et la fin du créneau.")
+    debut, fin = int(debut), int(fin)
+    if fin <= debut:
+        raise ValueError("L'heure de fin doit être postérieure à l'heure de début.")
+    if fin <= maintenant:
+        raise ValueError("La plage horaire choisie est déjà terminée.")
+    if fin - debut > 24 * 3600:
+        raise ValueError("Un créneau ne peut pas dépasser 24 heures.")
+    if debut > maintenant + 90 * 24 * 3600:
+        raise ValueError("Programme un accès dans les 90 prochains jours.")
+    ttl = fin - maintenant
     donnees = json.dumps({
-        "mode": mode, "expiration": expiration,
+        "mode": mode, "debut": debut, "expiration": fin,
         "prenom": prenom, "nom": nom, "classe": classe
     }, ensure_ascii=False)
     redis = _redis_acces()
     for _ in range(12):
         brut = _code_court_brut()
-        # NX empêche de remplacer un code encore actif en cas de collision.
-        cree = redis.set(_cle_code_court(brut), donnees, nx=True, ex=duree_heures * 3600)
+        cree = redis.set(_cle_code_court(brut), donnees, nx=True, ex=ttl)
         if cree:
-            return _formater_code_court(brut), expiration
+            return _formater_code_court(brut), fin
     raise RuntimeError("Impossible de réserver un code unique. Réessaie.")
+
+
+def _plage_horaire_programmee(date_jour, heure_debut, heure_fin):
+    """Interprète le jour et les heures dans le fuseau Europe/Paris."""
+    debut_dt = datetime.combine(date_jour, heure_debut, tzinfo=PARIS)
+    fin_dt = datetime.combine(date_jour, heure_fin, tzinfo=PARIS)
+    # Empêcher les heures inexistantes lors du passage à l'heure d'été.
+    for dt in (debut_dt, fin_dt):
+        if datetime.fromtimestamp(dt.timestamp(), PARIS).replace(fold=dt.fold) != dt:
+            raise ValueError("Cette heure n'existe pas ce jour-là (changement d'heure).")
+    return int(debut_dt.timestamp()), int(fin_dt.timestamp())
+
+
+def date_heure_locale(timestamp):
+    return datetime.fromtimestamp(timestamp, tz=PARIS).strftime("%d/%m/%Y à %H:%M")
 
 
 def verifier_acces_court(code):
@@ -221,11 +250,16 @@ def verifier_acces_court(code):
     try:
         donnees = json.loads(valeur.decode("utf-8") if isinstance(valeur, bytes) else valeur)
         expiration = int(donnees["expiration"])
+        debut = int(donnees.get("debut", 0))  # compatibilité anciens codes V3
         mode = donnees["mode"]
     except (ValueError, TypeError, KeyError):
         return False, 0, "Code invalide."
     if mode not in ("collectif", "individuel") or time.time() > expiration:
         return False, expiration, "Ce code a expiré."
+    if time.time() < debut:
+        return False, expiration, (
+            "Ce code sera utilisable à partir du " + date_heure_locale(debut) + "."
+        )
     if mode == "individuel":
         # Une seule admission : consommation atomique du code.
         try:
@@ -540,34 +574,48 @@ if not st.session_state.acces_autorise:
                 "Génère un code collectif XXXX-XXXX à communiquer aux élèves."
             )
 
-            duree = st.radio(
-                "Durée de validité",
-                ["1 heure", "2 heures"],
-                horizontal=True
+            mode_horaire_collectif = st.radio(
+                "Quand autoriser l'accès collectif ?",
+                ["Dès maintenant", "À une date et des heures précises"],
+                horizontal=True, key="horaire_collectif"
             )
+            if mode_horaire_collectif == "Dès maintenant":
+                duree = st.radio("Durée de validité", ["1 heure", "2 heures"], horizontal=True)
+            else:
+                date_collectif = st.date_input("Jour de l'accès collectif", value=datetime.now(PARIS).date())
+                col_debut, col_fin = st.columns(2)
+                with col_debut:
+                    debut_collectif = st.time_input("Début", value=datetime.strptime("16:00", "%H:%M").time(), key="debut_col")
+                with col_fin:
+                    fin_collectif = st.time_input("Fin", value=datetime.strptime("18:00", "%H:%M").time(), key="fin_col")
 
             if st.button("🔑 Générer un nouveau code élèves", use_container_width=True):
                 try:
-                    code, expiration = generer_acces_court(
-                        1 if duree == "1 heure" else 2, mode="collectif"
-                    )
-                except RuntimeError as e:
-                    st.error(str(e))
+                    if mode_horaire_collectif == "Dès maintenant":
+                        code, expiration = generer_acces_court(
+                            1 if duree == "1 heure" else 2, mode="collectif"
+                        )
+                        debut_effectif = int(time.time())
+                    else:
+                        debut_effectif, fin_effective = _plage_horaire_programmee(
+                            date_collectif, debut_collectif, fin_collectif
+                        )
+                        code, expiration = generer_acces_court(
+                            mode="collectif", debut=debut_effectif, fin=fin_effective
+                        )
+                except Exception as e:
+                    st.error(f"Impossible de générer le code : {e}")
                 else:
                     st.session_state.code_temporaire_genere = code
+                    st.session_state.code_temporaire_debut = debut_effectif
                     st.session_state.code_temporaire_expiration = expiration
 
             if st.session_state.code_temporaire_genere:
                 st.success("Code élèves prêt")
                 st.code(st.session_state.code_temporaire_genere, language=None)
-                st.write(
-                    "**Valable jusqu'à "
-                    f"{heure_locale(st.session_state.code_temporaire_expiration)}**"
-                )
-                st.caption(
-                    "Tu peux écrire ce code au tableau. Il deviendra "
-                    "automatiquement inutilisable après l'heure indiquée."
-                )
+                st.write("**Du " + date_heure_locale(st.session_state.get("code_temporaire_debut", 0))
+                         + " au " + date_heure_locale(st.session_state.code_temporaire_expiration) + "**")
+                st.caption("À communiquer aux élèves : utilisable seulement pendant ce créneau.")
 
             st.divider()
             st.subheader("🏠 Accès individuel à domicile — V2")
@@ -579,25 +627,58 @@ if not st.session_state.acces_autorise:
                 prenom_acces = st.text_input("Prénom de l'élève")
                 nom_acces = st.text_input("Nom de l'élève")
                 classe_acces = st.text_input("Classe", placeholder="Ex. 5B")
-                duree_individuelle = st.radio(
-                    "Durée de l'accès individuel", ["1 heure", "2 heures"], horizontal=True
+                mode_horaire_individuel = st.radio(
+                    "Quand autoriser l'accès individuel ?",
+                    ["Dès maintenant", "À une date et des heures précises"],
+                    horizontal=True, key="horaire_individuel"
                 )
+                if mode_horaire_individuel == "Dès maintenant":
+                    duree_individuelle = st.radio(
+                        "Durée de l'accès individuel", ["1 heure", "2 heures"], horizontal=True
+                    )
+                else:
+                    date_individuelle = st.date_input(
+                        "Jour de l'accès individuel", value=datetime.now(PARIS).date(), key="date_ind"
+                    )
+                    col_debut_i, col_fin_i = st.columns(2)
+                    with col_debut_i:
+                        debut_individuel = st.time_input(
+                            "Début", value=datetime.strptime("16:00", "%H:%M").time(), key="debut_ind"
+                        )
+                    with col_fin_i:
+                        fin_individuel = st.time_input(
+                            "Fin", value=datetime.strptime("18:00", "%H:%M").time(), key="fin_ind"
+                        )
                 demande_creation = st.form_submit_button("Créer un accès individuel")
             if demande_creation:
                 try:
-                    code_ind, expiration_ind = generer_acces_court(
-                        1 if duree_individuelle == "1 heure" else 2,
-                        mode="individuel", prenom=prenom_acces,
-                        nom=nom_acces, classe=classe_acces
-                    )
+                    if mode_horaire_individuel == "Dès maintenant":
+                        debut_ind_effectif = int(time.time())
+                        code_ind, expiration_ind = generer_acces_court(
+                            1 if duree_individuelle == "1 heure" else 2,
+                            mode="individuel", prenom=prenom_acces,
+                            nom=nom_acces, classe=classe_acces
+                        )
+                    else:
+                        debut_ind_effectif, fin_ind_effective = _plage_horaire_programmee(
+                            date_individuelle, debut_individuel, fin_individuel
+                        )
+                        code_ind, expiration_ind = generer_acces_court(
+                            mode="individuel", prenom=prenom_acces,
+                            nom=nom_acces, classe=classe_acces,
+                            debut=debut_ind_effectif, fin=fin_ind_effective
+                        )
                     st.session_state.code_individuel_genere = code_ind
+                    st.session_state.code_individuel_debut = debut_ind_effectif
                     st.session_state.code_individuel_expiration = expiration_ind
                 except Exception as exc:
                     st.error(f"Impossible de créer le code individuel : {exc}")
             if st.session_state.get("code_individuel_genere"):
                 st.success("Code individuel créé (utilisable une seule fois)")
                 st.code(st.session_state.code_individuel_genere, language=None)
-                st.write("**Valable jusqu'à " + heure_locale(
+                st.write("**Du " + date_heure_locale(
+                    st.session_state.get("code_individuel_debut", 0)
+                ) + " au " + date_heure_locale(
                     st.session_state.code_individuel_expiration
                 ) + "**")
                 st.caption(
