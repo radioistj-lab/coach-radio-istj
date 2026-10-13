@@ -165,6 +165,78 @@ def _redis_acces():
     return Redis(url=url, token=token)
 
 
+# Alphabet lisible : sans 0, O, 1, I, L, 5 ni S.
+ALPHABET_ACCES_COURT = "ABCDEFGHJKMNPQRTUVWXYZ2346789"
+
+
+def _code_court_brut():
+    return "".join(secrets.choice(ALPHABET_ACCES_COURT) for _ in range(8))
+
+
+def _formater_code_court(brut):
+    return f"{brut[:4]}-{brut[4:]}"
+
+
+def _cle_code_court(code):
+    digest = hashlib.sha256(code.encode("ascii")).hexdigest()
+    return f"coach_radio:short_access:v3:{digest}"
+
+
+def generer_acces_court(duree_heures, mode="collectif", prenom="", nom="", classe=""):
+    duree_heures = int(duree_heures)
+    if duree_heures not in (1, 2):
+        raise ValueError("Durée non autorisée.")
+    if mode not in ("collectif", "individuel"):
+        raise ValueError("Mode d'accès inconnu.")
+    prenom, nom, classe = (" ".join(str(v).split()) for v in (prenom, nom, classe))
+    if mode == "individuel" and not all((prenom, nom, classe)):
+        raise ValueError("Renseigne le prénom, le nom et la classe.")
+    expiration = int(time.time()) + duree_heures * 3600
+    donnees = json.dumps({
+        "mode": mode, "expiration": expiration,
+        "prenom": prenom, "nom": nom, "classe": classe
+    }, ensure_ascii=False)
+    redis = _redis_acces()
+    for _ in range(12):
+        brut = _code_court_brut()
+        # NX empêche de remplacer un code encore actif en cas de collision.
+        cree = redis.set(_cle_code_court(brut), donnees, nx=True, ex=duree_heures * 3600)
+        if cree:
+            return _formater_code_court(brut), expiration
+    raise RuntimeError("Impossible de réserver un code unique. Réessaie.")
+
+
+def verifier_acces_court(code):
+    brut = _normaliser_code_individuel(code)
+    if len(brut) != 8 or any(c not in ALPHABET_ACCES_COURT for c in brut):
+        return False, 0, "Code invalide."
+    redis = _redis_acces()
+    cle = _cle_code_court(brut)
+    try:
+        valeur = redis.get(cle)
+    except Exception:
+        return False, 0, "La vérification des codes est momentanément indisponible."
+    if not valeur:
+        return False, 0, "Code incorrect ou expiré."
+    try:
+        donnees = json.loads(valeur.decode("utf-8") if isinstance(valeur, bytes) else valeur)
+        expiration = int(donnees["expiration"])
+        mode = donnees["mode"]
+    except (ValueError, TypeError, KeyError):
+        return False, 0, "Code invalide."
+    if mode not in ("collectif", "individuel") or time.time() > expiration:
+        return False, expiration, "Ce code a expiré."
+    if mode == "individuel":
+        # Une seule admission : consommation atomique du code.
+        try:
+            consommation = redis.getdel(cle)
+        except Exception:
+            return False, 0, "Vérification indisponible."
+        if not consommation:
+            return False, 0, "Code déjà utilisé ou expiré."
+    return True, expiration, ""
+
+
 def _normaliser_code_individuel(code):
     return "".join(c for c in str(code).upper() if c.isalnum())
 
@@ -390,12 +462,21 @@ if not st.session_state.acces_autorise:
 
         code_saisi = st.text_input(
             "Code élèves",
-            placeholder="XXXX-XXXX-XXXX-XXXX-XXX"
+            placeholder="XXXX-XXXX"
         )
 
         if st.button("Entrer", use_container_width=True):
+            essais = [t for t in st.session_state.get("essais_acces", []) if time.time() - t < 60]
+            if len(essais) >= 5:
+                st.error("Trop de tentatives. Réessaie dans une minute.")
+                afficher_pied_page_application()
+                st.stop()
+            st.session_state.essais_acces = essais + [time.time()]
             try:
-                if len(_normaliser_code_individuel(code_saisi)) == 16:
+                brut_saisi = _normaliser_code_individuel(code_saisi)
+                if len(brut_saisi) == 8:
+                    valide, expiration, message = verifier_acces_court(code_saisi)
+                elif len(brut_saisi) == 16:
                     valide, expiration, message = verifier_acces_individuel(code_saisi)
                 else:
                     valide, expiration, message = verifier_code_temporaire(code_saisi)
@@ -405,6 +486,7 @@ if not st.session_state.acces_autorise:
                 st.stop()
 
             if valide:
+                st.session_state.essais_acces = []
                 st.session_state.acces_autorise = True
                 st.session_state.acces_expire_at = expiration
                 st.rerun()
@@ -455,7 +537,7 @@ if not st.session_state.acces_autorise:
 
             st.subheader("👩‍🏫 Espace professeur")
             st.write(
-                "Génère un code à communiquer aux élèves au début de la séance."
+                "Génère un code collectif XXXX-XXXX à communiquer aux élèves."
             )
 
             duree = st.radio(
@@ -466,8 +548,8 @@ if not st.session_state.acces_autorise:
 
             if st.button("🔑 Générer un nouveau code élèves", use_container_width=True):
                 try:
-                    code, expiration = generer_code_temporaire(
-                        1 if duree == "1 heure" else 2
+                    code, expiration = generer_acces_court(
+                        1 if duree == "1 heure" else 2, mode="collectif"
                     )
                 except RuntimeError as e:
                     st.error(str(e))
@@ -503,9 +585,10 @@ if not st.session_state.acces_autorise:
                 demande_creation = st.form_submit_button("Créer un accès individuel")
             if demande_creation:
                 try:
-                    code_ind, expiration_ind = generer_acces_individuel(
-                        prenom_acces, nom_acces, classe_acces,
-                        1 if duree_individuelle == "1 heure" else 2
+                    code_ind, expiration_ind = generer_acces_court(
+                        1 if duree_individuelle == "1 heure" else 2,
+                        mode="individuel", prenom=prenom_acces,
+                        nom=nom_acces, classe=classe_acces
                     )
                     st.session_state.code_individuel_genere = code_ind
                     st.session_state.code_individuel_expiration = expiration_ind
