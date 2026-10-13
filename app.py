@@ -623,34 +623,34 @@ if not st.session_state.acces_autorise:
                 "Ce code ouvre une seule session du Coach. L'élève utilisera ensuite "
                 "son code de reprise habituel pour retrouver son travail."
             )
-            with st.form("form_acces_individuel"):
-                prenom_acces = st.text_input("Prénom de l'élève")
-                nom_acces = st.text_input("Nom de l'élève")
-                classe_acces = st.text_input("Classe", placeholder="Ex. 5B")
-                mode_horaire_individuel = st.radio(
-                    "Quand autoriser l'accès individuel ?",
-                    ["Dès maintenant", "À une date et des heures précises"],
-                    horizontal=True, key="horaire_individuel"
+            # Hors formulaire : la sélection du mode actualise immédiatement les champs.
+            prenom_acces = st.text_input("Prénom de l'élève")
+            nom_acces = st.text_input("Nom de l'élève")
+            classe_acces = st.text_input("Classe", placeholder="Ex. 5B")
+            mode_horaire_individuel = st.radio(
+                "Quand autoriser l'accès individuel ?",
+                ["Dès maintenant", "À une date et des heures précises"],
+                horizontal=True, key="horaire_individuel"
+            )
+            if mode_horaire_individuel == "Dès maintenant":
+                duree_individuelle = st.radio(
+                    "Durée de l'accès individuel", ["1 heure", "2 heures"], horizontal=True
                 )
-                if mode_horaire_individuel == "Dès maintenant":
-                    duree_individuelle = st.radio(
-                        "Durée de l'accès individuel", ["1 heure", "2 heures"], horizontal=True
+            else:
+                date_individuelle = st.date_input(
+                    "Jour de l'accès individuel (JJ/MM/AAAA)", value=datetime.now(PARIS).date(),
+                    format="DD/MM/YYYY", key="date_ind"
+                )
+                col_debut_i, col_fin_i = st.columns(2)
+                with col_debut_i:
+                    debut_individuel = st.time_input(
+                        "Début", value=datetime.strptime("16:00", "%H:%M").time(), key="debut_ind"
                     )
-                else:
-                    date_individuelle = st.date_input(
-                        "Jour de l'accès individuel (JJ/MM/AAAA)", value=datetime.now(PARIS).date(),
-                        format="DD/MM/YYYY", key="date_ind"
+                with col_fin_i:
+                    fin_individuel = st.time_input(
+                        "Fin", value=datetime.strptime("18:00", "%H:%M").time(), key="fin_ind"
                     )
-                    col_debut_i, col_fin_i = st.columns(2)
-                    with col_debut_i:
-                        debut_individuel = st.time_input(
-                            "Début", value=datetime.strptime("16:00", "%H:%M").time(), key="debut_ind"
-                        )
-                    with col_fin_i:
-                        fin_individuel = st.time_input(
-                            "Fin", value=datetime.strptime("18:00", "%H:%M").time(), key="fin_ind"
-                        )
-                demande_creation = st.form_submit_button("Créer un accès individuel")
+            demande_creation = st.button("Créer un accès individuel", key="creer_acces_individuel")
             if demande_creation:
                 try:
                     if mode_horaire_individuel == "Dès maintenant":
