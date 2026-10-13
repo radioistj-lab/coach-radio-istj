@@ -150,6 +150,68 @@ def verifier_code_temporaire(code):
     return True, expiration, ""
 
 
+# =========================================================
+# V2 — ACCES INDIVIDUELS (stockage distant, usage unique)
+# =========================================================
+
+def _redis_acces():
+    try:
+        url = str(st.secrets["UPSTASH_REDIS_REST_URL"]).strip()
+        token = str(st.secrets["UPSTASH_REDIS_REST_TOKEN"]).strip()
+    except Exception:
+        raise RuntimeError("Upstash Redis n'est pas configuré.")
+    if not url or not token:
+        raise RuntimeError("Upstash Redis n'est pas configuré.")
+    return Redis(url=url, token=token)
+
+
+def _normaliser_code_individuel(code):
+    return "".join(c for c in str(code).upper() if c.isalnum())
+
+
+def _cle_acces_individuel(code):
+    # Ne pas conserver le code en clair dans la clé Redis.
+    digest = hashlib.sha256(code.encode("ascii")).hexdigest()
+    return f"coach_radio:individual_access:v2:{digest}"
+
+
+def generer_acces_individuel(prenom, nom, classe, duree_heures):
+    prenom, nom, classe = (" ".join(str(v).split()) for v in (prenom, nom, classe))
+    if not prenom or not nom or not classe:
+        raise ValueError("Renseigne le prénom, le nom et la classe.")
+    duree_heures = int(duree_heures)
+    if duree_heures not in (1, 2):
+        raise ValueError("Durée non autorisée.")
+    expiration = int(time.time()) + duree_heures * 3600
+    brut = secrets.token_hex(8).upper()  # 64 bits d'aléa
+    code = f"{brut[:4]}-{brut[4:8]}-{brut[8:12]}-{brut[12:]}"
+    donnees = {"prenom": prenom, "nom": nom, "classe": classe, "expiration": expiration}
+    _redis_acces().set(_cle_acces_individuel(brut), json.dumps(donnees), ex=duree_heures * 3600)
+    return code, expiration
+
+
+def verifier_acces_individuel(code):
+    brut = _normaliser_code_individuel(code)
+    if len(brut) != 16 or any(c not in "0123456789ABCDEF" for c in brut):
+        return False, 0, "Code individuel invalide."
+    # GETDEL est atomique : un code ne peut ouvrir qu'une seule nouvelle session.
+    # Si la commande n'est pas disponible, refuser plutôt que dégrader la sécurité.
+    try:
+        valeur = _redis_acces().getdel(_cle_acces_individuel(brut))
+    except Exception:
+        return False, 0, "La vérification du code individuel est indisponible."
+    if not valeur:
+        return False, 0, "Ce code est expiré, incorrect ou déjà utilisé."
+    try:
+        donnees = json.loads(valeur.decode("utf-8") if isinstance(valeur, bytes) else valeur)
+        expiration = int(donnees["expiration"])
+    except (ValueError, TypeError, KeyError):
+        return False, 0, "Code individuel invalide."
+    if time.time() > expiration:
+        return False, expiration, "Ce code a expiré."
+    return True, expiration, ""
+
+
 def heure_locale(timestamp):
     return datetime.fromtimestamp(timestamp, tz=PARIS).strftime("%H:%M")
 
@@ -323,7 +385,7 @@ if not st.session_state.acces_autorise:
         st.subheader("🎙️ Accès élève")
         st.write(
             "Entre le code temporaire donné par ton professeur "
-            "pour utiliser le Coach Radio ISTJ."
+            "pour utiliser le Coach Radio ISTJ (collectif ou individuel)."
         )
 
         code_saisi = st.text_input(
@@ -333,7 +395,10 @@ if not st.session_state.acces_autorise:
 
         if st.button("Entrer", use_container_width=True):
             try:
-                valide, expiration, message = verifier_code_temporaire(code_saisi)
+                if len(_normaliser_code_individuel(code_saisi)) == 16:
+                    valide, expiration, message = verifier_acces_individuel(code_saisi)
+                else:
+                    valide, expiration, message = verifier_code_temporaire(code_saisi)
             except RuntimeError as e:
                 st.error(str(e))
                 afficher_pied_page_application()
@@ -423,11 +488,48 @@ if not st.session_state.acces_autorise:
                 )
 
             st.divider()
+            st.subheader("🏠 Accès individuel à domicile — V2")
+            st.caption(
+                "Ce code ouvre une seule session du Coach. L'élève utilisera ensuite "
+                "son code de reprise habituel pour retrouver son travail."
+            )
+            with st.form("form_acces_individuel"):
+                prenom_acces = st.text_input("Prénom de l'élève")
+                nom_acces = st.text_input("Nom de l'élève")
+                classe_acces = st.text_input("Classe", placeholder="Ex. 5B")
+                duree_individuelle = st.radio(
+                    "Durée de l'accès individuel", ["1 heure", "2 heures"], horizontal=True
+                )
+                demande_creation = st.form_submit_button("Créer un accès individuel")
+            if demande_creation:
+                try:
+                    code_ind, expiration_ind = generer_acces_individuel(
+                        prenom_acces, nom_acces, classe_acces,
+                        1 if duree_individuelle == "1 heure" else 2
+                    )
+                    st.session_state.code_individuel_genere = code_ind
+                    st.session_state.code_individuel_expiration = expiration_ind
+                except Exception as exc:
+                    st.error(f"Impossible de créer le code individuel : {exc}")
+            if st.session_state.get("code_individuel_genere"):
+                st.success("Code individuel créé (utilisable une seule fois)")
+                st.code(st.session_state.code_individuel_genere, language=None)
+                st.write("**Valable jusqu'à " + heure_locale(
+                    st.session_state.code_individuel_expiration
+                ) + "**")
+                st.caption(
+                    "Communique ce code uniquement à l'élève concerné. "
+                    "Le prénom, le nom et la classe sont des repères pour le professeur : "
+                    "ils ne constituent pas une preuve d'identité."
+                )
+
+            st.divider()
 
             if st.button("Fermer l'espace professeur"):
                 st.session_state.professeur_autorise = False
                 st.session_state.code_temporaire_genere = ""
                 st.session_state.code_temporaire_expiration = 0
+                st.session_state.code_individuel_genere = ""
                 st.session_state.mode_acces = ""
                 st.rerun()
 
