@@ -582,7 +582,7 @@ if not st.session_state.acces_autorise:
             if mode_horaire_collectif == "Dès maintenant":
                 duree = st.radio("Durée de validité", ["1 heure", "2 heures"], horizontal=True)
             else:
-                date_collectif = st.date_input("Jour de l'accès collectif", value=datetime.now(PARIS).date())
+                date_collectif = st.date_input("Jour de l'accès collectif", value=datetime.now(PARIS).date(), format="DD/MM/YYYY")
                 col_debut, col_fin = st.columns(2)
                 with col_debut:
                     debut_collectif = st.time_input("Début", value=datetime.strptime("16:00", "%H:%M").time(), key="debut_col")
@@ -618,7 +618,7 @@ if not st.session_state.acces_autorise:
                 st.caption("À communiquer aux élèves : utilisable seulement pendant ce créneau.")
 
             st.divider()
-            st.subheader("🏠 Accès individuel à domicile — V2")
+            st.subheader("🏠 Accès individuel à domicile")
             st.caption(
                 "Ce code ouvre une seule session du Coach. L'élève utilisera ensuite "
                 "son code de reprise habituel pour retrouver son travail."
@@ -638,7 +638,8 @@ if not st.session_state.acces_autorise:
                     )
                 else:
                     date_individuelle = st.date_input(
-                        "Jour de l'accès individuel", value=datetime.now(PARIS).date(), key="date_ind"
+                        "Jour de l'accès individuel (JJ/MM/AAAA)", value=datetime.now(PARIS).date(),
+                        format="DD/MM/YYYY", key="date_ind"
                     )
                     col_debut_i, col_fin_i = st.columns(2)
                     with col_debut_i:
