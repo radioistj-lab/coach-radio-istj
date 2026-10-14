@@ -235,7 +235,14 @@ def date_heure_locale(timestamp):
     return datetime.fromtimestamp(timestamp, tz=PARIS).strftime("%d/%m/%Y à %H:%M")
 
 
-def verifier_acces_court(code):
+def _identite_normalisee(texte):
+    import unicodedata
+    nettoye = unicodedata.normalize("NFKD", " ".join(str(texte).strip().split()))
+    return "".join(c for c in nettoye if not unicodedata.combining(c)).casefold()
+
+
+def verifier_acces_court(code, prenom="", nom="", classe=""):
+
     brut = _normaliser_code_individuel(code)
     if len(brut) != 8 or any(c not in ALPHABET_ACCES_COURT for c in brut):
         return False, 0, "Code invalide."
@@ -261,13 +268,23 @@ def verifier_acces_court(code):
             "Ce code sera utilisable à partir du " + date_heure_locale(debut) + "."
         )
     if mode == "individuel":
-        # Une seule admission : consommation atomique du code.
+        for champ, saisi in (("prenom", prenom), ("nom", nom), ("classe", classe)):
+            attendu = donnees.get(champ, "")
+            if _identite_normalisee(saisi) != _identite_normalisee(attendu):
+                return False, expiration, (
+                    "Les informations saisies ne correspondent pas à cet accès individuel. "
+                    "Vérifie le prénom, le nom et la classe."
+                )
+        # Ne consommer le code qu'après vérification de l'identité déclarée.
         try:
             consommation = redis.getdel(cle)
         except Exception:
             return False, 0, "Vérification indisponible."
         if not consommation:
             return False, 0, "Code déjà utilisé ou expiré."
+        # Défense contre une modification entre lecture et consommation.
+        if consommation != valeur:
+            return False, 0, "Autorisation modifiée pendant la vérification. Réessaie."
     return True, expiration, ""
 
 
@@ -486,20 +503,37 @@ if not st.session_state.acces_autorise:
         with col_retour:
             if st.button("← Changer de profil"):
                 st.session_state.mode_acces = ""
+                st.session_state.pop("identite_entree", None)
                 st.rerun()
 
         st.subheader("🎙️ Accès élève")
         st.write(
-            "Entre le code temporaire donné par ton professeur "
-            "pour utiliser le Coach Radio ISTJ (collectif ou individuel)."
+            "Saisis ton code d'accès, ton prénom, ton nom et ta classe "
+            "pour entrer dans le Coach."
         )
 
-        code_saisi = st.text_input(
-            "Code élèves",
-            placeholder="XXXX-XXXX"
-        )
+        with st.form("formulaire_entree_eleve"):
+            code_saisi = st.text_input(
+                "Code d'accès donné par ton professeur",
+                placeholder="XXXX-XXXX"
+            )
+            col_prenom, col_nom = st.columns(2)
+            with col_prenom:
+                prenom_saisi = st.text_input("Prénom")
+            with col_nom:
+                nom_saisi = st.text_input("Nom")
+            classe_saisie = st.text_input("Classe", placeholder="Ex. 5B")
+            entrer_eleve = st.form_submit_button(
+                "Entrer dans le Coach", use_container_width=True
+            )
 
-        if st.button("Entrer", use_container_width=True):
+        if entrer_eleve:
+            if not all(v.strip() for v in (
+                code_saisi, prenom_saisi, nom_saisi, classe_saisie
+            )):
+                st.error("Renseigne le code, le prénom, le nom et la classe.")
+                afficher_pied_page_application()
+                st.stop()
             essais = [t for t in st.session_state.get("essais_acces", []) if time.time() - t < 60]
             if len(essais) >= 5:
                 st.error("Trop de tentatives. Réessaie dans une minute.")
@@ -509,7 +543,9 @@ if not st.session_state.acces_autorise:
             try:
                 brut_saisi = _normaliser_code_individuel(code_saisi)
                 if len(brut_saisi) == 8:
-                    valide, expiration, message = verifier_acces_court(code_saisi)
+                    valide, expiration, message = verifier_acces_court(
+                        code_saisi, prenom_saisi, nom_saisi, classe_saisie
+                    )
                 elif len(brut_saisi) == 16:
                     valide, expiration, message = verifier_acces_individuel(code_saisi)
                 else:
@@ -523,6 +559,11 @@ if not st.session_state.acces_autorise:
                 st.session_state.essais_acces = []
                 st.session_state.acces_autorise = True
                 st.session_state.acces_expire_at = expiration
+                st.session_state.identite_entree = {
+                    "prenom": " ".join(prenom_saisi.split()),
+                    "nom": " ".join(nom_saisi.split()),
+                    "classe": " ".join(classe_saisie.upper().split()),
+                }
                 st.rerun()
             else:
                 st.error(message)
@@ -696,6 +737,7 @@ if not st.session_state.acces_autorise:
                 st.session_state.code_temporaire_expiration = 0
                 st.session_state.code_individuel_genere = ""
                 st.session_state.mode_acces = ""
+                st.session_state.pop("identite_entree", None)
                 st.rerun()
 
     afficher_pied_page_application()
@@ -1833,19 +1875,22 @@ if not st.session_state.projet_actif:
             "ton travail dans le Coach Radio."
         )
 
-        nouveau_prenom = st.text_input(
-            "Prénom",
-            key="projet_nouveau_prenom"
-        )
-        nouveau_nom = st.text_input(
-            "Nom",
-            key="projet_nouveau_nom"
-        )
-        nouveau_classe = st.text_input(
-            "Classe",
-            placeholder="Ex. 5B",
-            key="projet_nouveau_classe"
-        )
+        identite_entree = st.session_state.get("identite_entree", {})
+        if identite_entree:
+            nouveau_prenom = identite_entree["prenom"]
+            nouveau_nom = identite_entree["nom"]
+            nouveau_classe = identite_entree["classe"]
+            st.info(
+                f"Projet de {nouveau_prenom} {nouveau_nom} — "
+                f"classe {nouveau_classe}."
+            )
+        else:
+            # Connexion professeur : conserver le parcours existant.
+            nouveau_prenom = st.text_input("Prénom", key="projet_nouveau_prenom")
+            nouveau_nom = st.text_input("Nom", key="projet_nouveau_nom")
+            nouveau_classe = st.text_input(
+                "Classe", placeholder="Ex. 5B", key="projet_nouveau_classe"
+            )
 
         if st.button(
             "Créer mon projet",
