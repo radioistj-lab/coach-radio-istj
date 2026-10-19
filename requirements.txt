@@ -1,3 +1,4 @@
 openai
 reportlab
 upstash-redis
+pypdf>=5.0,<7.0
