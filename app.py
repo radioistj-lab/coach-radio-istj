@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 from openai import OpenAI
 from upstash_redis import Redis
+from pdf_source import extraire_source_pdf
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
@@ -2160,6 +2161,37 @@ if st.session_state.etape == "accueil":
             "Le Coach t'aide à le comprendre, construire ton plan "
             "et rédiger ta chronique."
         )
+
+        st.write("**Tu peux aussi importer directement un article PDF :**")
+        pdf_article = st.file_uploader(
+            "Importer un PDF",
+            type=["pdf"],
+            key="pdf_source_accueil",
+            help="Fichier PDF de 10 Mo maximum, contenant du texte sélectionnable."
+        )
+        if pdf_article is not None:
+            fichier_id = (
+                pdf_article.name,
+                pdf_article.size,
+                pdf_article.file_id
+            )
+            if st.session_state.get("_pdf_source_traite") != fichier_id:
+                try:
+                    texte_pdf_source, pages_pdf_source = extraire_source_pdf(
+                        pdf_article.getvalue()
+                    )
+                except ValueError as erreur_pdf:
+                    st.error(str(erreur_pdf))
+                else:
+                    st.session_state["source"] = texte_pdf_source
+                    st.session_state[cle_widget_projet("source")] = texte_pdf_source
+                    st.session_state["_pdf_source_traite"] = fichier_id
+                    st.rerun()
+            else:
+                st.success(
+                    "PDF importé : son texte et ses références sont placés "
+                    "dans la source ci-dessous. Tu peux les relire ou les compléter."
+                )
 
         source = champ_texte_projet(
             "source",
